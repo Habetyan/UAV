@@ -252,113 +252,94 @@ class WarmupScheduler(torch.optim.lr_scheduler._LRScheduler):
             decay = max(self.decay_factor ** (self.last_epoch - self.warmup_steps), self.min_lr / self.base_lrs[0])
             return [max(base_lr * decay, self.min_lr) for base_lr in self.base_lrs]
 
-def train_model(model, train_dl, val_dl, device, 
-                epochs=1, patience=15, lr=1e-4, 
-                weight_decay=1e-4, seq_len=32,
-                clip_value=0.5, warmup_steps=2):
-    scaler = torch.cuda.amp.GradScaler()
-    
+def train_model(model, train_dl, val_dl, device, epochs, patience, lr, weight_decay, seq_len, clip_value=0.5, warmup_steps=3):
+    # Initialize optimizer and scheduler
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = WarmupScheduler(optimizer, warmup_steps=warmup_steps)
     
-    scheduler = WarmupScheduler(
-        optimizer, warmup_steps=warmup_steps, decay_factor=0.97, min_lr=1e-6
-    )
-    
-    criterion = nn.MSELoss()
-    
+    # Training loop
+    best_val_loss = float('inf')
+    no_improvement = 0
     history = {
         'train_loss': [],
         'val_loss': [],
         'val_rmse': [],
         'val_r2': [],
-        'learning_rates': []
+        'lr': []
     }
     
-    best_val_loss = float('inf')
-    best_model_state = None
-    no_improvement_count = 0
-    
     for epoch in range(1, epochs + 1):
+        # Training phase
         model.train()
         train_losses = []
-        
         train_pbar = tqdm(train_dl, desc=f"Epoch {epoch}/{epochs} [Train]")
         
-        for X_batch, y_batch in train_pbar:
-            X_batch = X_batch.to(device, non_blocking=True)
-            y_batch = y_batch.to(device, non_blocking=True)
+        for Xb, yb in train_pbar:
+            Xb, yb = Xb.to(device), yb.to(device)
             
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad()
+            outputs = model(Xb)
+            loss = nn.MSELoss()(outputs, yb)
+            loss.backward()
             
-            with torch.cuda.amp.autocast():
-                outputs = model(X_batch)
-                loss = criterion(outputs, y_batch)
-            
-            scaler.scale(loss).backward()
-            
-            scaler.unscale_(optimizer)
+            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_value)
             
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
+            scheduler.step()
             
             train_losses.append(loss.item())
-            
             train_pbar.set_postfix({'loss': f'{loss.item():.4f}', 'lr': f'{scheduler.get_lr()[0]:.7f}'})
         
-        scheduler.step()
-        
-        history['learning_rates'].append(scheduler.get_lr()[0])
-        
-        avg_train_loss = np.mean(train_losses)
-        history['train_loss'].append(avg_train_loss)
-        
+        # Validation phase
         model.eval()
         val_losses = []
         val_preds = []
-        val_targets = []
+        val_trues = []
         
-        val_pbar = tqdm(val_dl, desc=f"Epoch {epoch}/{epochs} [Valid]")
-        
-        with torch.no_grad(), torch.cuda.amp.autocast():
-            for X_batch, y_batch in val_pbar:
-                X_batch = X_batch.to(device, non_blocking=True)
-                y_batch = y_batch.to(device, non_blocking=True)
-                
-                outputs = model(X_batch)
-                loss = criterion(outputs, y_batch)
-                
+        with torch.no_grad():
+            for Xb, yb in val_dl:
+                Xb, yb = Xb.to(device), yb.to(device)
+                outputs = model(Xb)
+                loss = nn.MSELoss()(outputs, yb)
                 val_losses.append(loss.item())
-                
-                val_preds.extend(outputs.cpu().numpy())
-                val_targets.extend(y_batch.cpu().numpy())
-                
-                val_pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+                val_preds.append(outputs.cpu().numpy())
+                val_trues.append(yb.cpu().numpy())
         
+        # Calculate metrics
+        avg_train_loss = np.mean(train_losses)
         avg_val_loss = np.mean(val_losses)
-        val_rmse = math.sqrt(mean_squared_error(val_targets, val_preds))
-        val_r2 = r2_score(val_targets, val_preds)
+        val_preds = np.concatenate(val_preds)
+        val_trues = np.concatenate(val_trues)
+        val_rmse = math.sqrt(mean_squared_error(val_trues, val_preds))
+        val_r2 = r2_score(val_trues, val_preds)
         
+        # Update history
+        history['train_loss'].append(avg_train_loss)
         history['val_loss'].append(avg_val_loss)
         history['val_rmse'].append(val_rmse)
         history['val_r2'].append(val_r2)
+        history['lr'].append(scheduler.get_lr()[0])
         
-        print(f"Epoch {epoch} | Train Loss: {avg_train_loss:.6f} | "
-              f"Val Loss: {avg_val_loss:.6f} | Val RMSE: {val_rmse:.6f} | Val R²: {val_r2:.4f}")
+        # Log metrics
+        print(f"\nEpoch {epoch}/{epochs}")
+        print(f"Train Loss: {avg_train_loss:.6f}")
+        print(f"Val Loss: {avg_val_loss:.6f}")
+        print(f"Val RMSE: {val_rmse:.6f}")
+        print(f"Val R²: {val_r2:.4f}")
+        print(f"LR: {scheduler.get_lr()[0]:.7f}")
         
+        # Early stopping
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            no_improvement_count = 0
-            best_model_state = model.state_dict().copy()
-            torch.save(model.state_dict(), 'best_model.pth')
-            print(f"Saved best model with validation loss: {best_val_loss:.6f}")
+            no_improvement = 0
+            torch.save(model.state_dict(), 'best.pth')
+            print(f"New best model saved! (Val Loss: {best_val_loss:.6f})")
         else:
-            no_improvement_count += 1
-            if no_improvement_count >= patience:
-                print(f"Early stopping after {epoch} epochs")
+            no_improvement += 1
+            if no_improvement >= patience:
+                print(f"Early stopping triggered after {epoch} epochs")
                 break
-    
-    model.load_state_dict(torch.load('best_model.pth'))
     
     return model, history
 
@@ -417,7 +398,7 @@ def visualize_results(history, y_test=None, y_pred=None):
     plt.grid(True)
     
     plt.subplot(2, 2, 4)
-    plt.plot(history['learning_rates'], label='Learning Rate', marker='.')
+    plt.plot(history['lr'], label='Learning Rate', marker='.')
     plt.title('Learning Rate Schedule')
     plt.xlabel('Epoch')
     plt.ylabel('Learning Rate')
